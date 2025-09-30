@@ -1,18 +1,17 @@
 """
 Keith (artcmd)
-1st update 9/23/2025
-2nd update 9/30/2025
+1st update 9/30/2025
 
-Qwen3 with vLLM as offline inference engine
-model: Qwen/Qwen3-30B-A3B-Thinking-2507-FP8
+GPT-OSS with vLLM as offline inference engine
+model: openai/gpt-oss-120b
 GPU: one single Nvidia H100
 
-package version in conda environment: python=3.11.13
-Name                     Version          Build            Channel
-vllm                     0.10.2           pypi_0           pypi
-torch                    2.8.0            pypi_0           pypi
-tokenizers               0.22.1           pypi_0           pypi
-transformers             4.57.0.dev0      pypi_0           pypi
+package version in conda environment: python=3.12.11
+Name                     Version                   Build            Channel
+vllm                     0.10.1+gptoss             pypi_0           pypi
+torch                    2.9.0.dev20250804+cu128   pypi_0           pypi
+tokenizers               0.22.1                    pypi_0           pypi
+transformers             4.56.2                    pypi_0           pypi
 """
 
 import os
@@ -20,44 +19,48 @@ from datetime import datetime
 from typing import List
 
 import torch
+from openai_harmony import (
+    HarmonyEncodingName,
+    load_harmony_encoding,
+    Conversation,
+    Message,
+    Role,
+    SystemContent,
+    ReasoningEffort,
+)
 from tqdm import tqdm
-from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
 
-def prepare_chat_messages(prompts: List[str], tokenizer) -> List[str]:
+# https://cookbook.openai.com/articles/gpt-oss/run-vllm
+# https://cookbook.openai.com/articles/openai-harmony
+# https://cookbook.openai.com/articles/gpt-oss/handle-raw-cot
+def prepare_chat_messages(prompts: List[str]) -> List[Conversation]:
     formatted_prompts = []
     for prompt in prompts:
-        messages = [{'role': 'user', 'content': prompt}]
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=True
+        convo = Conversation.from_messages([
+            Message.from_role_and_content(Role.SYSTEM, SystemContent.new().with_reasoning_effort(ReasoningEffort.HIGH)),
+            Message.from_role_and_content(Role.USER, prompt)]
         )
-        formatted_prompts.append(text)
+        formatted_prompts.append(convo)
     return formatted_prompts
 
 
-def extract_response_from_output(output_text):
-    """
-    The thinking content should be between <think> and </think> tags
-
-    Note: Qwen3 output contains only </think> without an explicit opening <think> tag
-    """
+def extract_response_from_output(output_list):
+    thinking_steps = ""
+    final_answer = ""
     try:
-        # Find the last </think> tag and extract content after it
-        if '</think>' in output_text:
-            thinking = output_text.split('</think>')[0].strip()
-            content = output_text.split('</think>')[-1].strip()
-        else:
-            thinking = ''
-            content = output_text.strip()
-        return content, thinking
+        for entry in output_list:
+            d = entry.to_dict()
+            if d.get("channel") == "analysis" and d.get("role") == "assistant":
+                content_list = d.get("content", [])
+                thinking_steps = content_list[0].get("text", "")
+            elif d.get("channel") == "final" and d.get("role") == "assistant":
+                content_list = d.get("content", [])
+                final_answer = content_list[0].get("text", "")
+        return final_answer, thinking_steps
     except Exception:
-        thinking = ''
-        content = output_text.strip()
-        return content, thinking
+        return final_answer, thinking_steps
 
 
 def write_prompt_thinking_response(output_path, prompt, thinking_chain, response):
@@ -71,7 +74,7 @@ def write_prompt_thinking_response(output_path, prompt, thinking_chain, response
 
 
 def use_vllm(all_prompts,
-             model_name='Qwen/Qwen3-30B-A3B-Thinking-2507-FP8', gpu_memory=0.9, context_len=65536,
+             model_name='openai/gpt-oss-120b', gpu_memory=0.9, context_len=65536,
              sp_max=32768, sp_temp=0.6, sp_p=0.95, sp_k=20, sp_rp=1.0, sp_pp=0.0):
     name = model_name.split('/')[-1]
     current_time = datetime.now().strftime('%y%m%d%H%M%S')
@@ -82,36 +85,38 @@ def use_vllm(all_prompts,
     os.makedirs(thinking_dir, exist_ok=True)
     print('[I:use_vllm]', tensor_parallel_size, 'GPUs are detected!')
 
-    # https://docs.vllm.ai/en/v0.10.2/api/vllm/#vllm.LLM
+    prompt_texts = [item['llm_prompt'] for item in all_prompts]
+    formatted_prompts = prepare_chat_messages(prompt_texts)
+    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    prefill_ids = [encoding.render_conversation_for_completion(conv, Role.ASSISTANT) for conv in formatted_prompts]
+    stop_token_ids = encoding.stop_tokens_for_assistant_actions()
+
     llm = LLM(model=model_name,
               dtype='auto',
               tensor_parallel_size=tensor_parallel_size,
               trust_remote_code=True,
               gpu_memory_utilization=gpu_memory,
               max_model_len=context_len)
-    # https://docs.vllm.ai/en/v0.10.2/api/vllm/sampling_params.html
     sampling_params = SamplingParams(max_tokens=sp_max,
                                      temperature=sp_temp,
                                      top_p=sp_p,
                                      top_k=sp_k,
                                      repetition_penalty=sp_rp,
                                      presence_penalty=sp_pp,
+                                     stop_token_ids=stop_token_ids,
                                      seed=42)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-    print(f'Total prompts to process: {len(all_prompts)}')
-    prompt_texts = [item for item in all_prompts]
-    formatted_prompts = prepare_chat_messages(prompt_texts, tokenizer)
-    all_outputs = llm.generate(formatted_prompts, sampling_params)
+    print('[I] ---- ', llm.llm_engine.model_config.max_model_len)
+    all_outputs = llm.generate(prompt_token_ids=prefill_ids, sampling_params=sampling_params)
 
     for i, output in enumerate(tqdm(all_outputs, desc='Processing outputs')):
-        generated_text = output.outputs[0].text
+        generated_text = encoding.parse_messages_from_completion_tokens(output.outputs[0].token_ids, Role.ASSISTANT)
         response, thinking_chain = extract_response_from_output(generated_text)
+
         thinking_path = os.path.join(thinking_dir, f'thinking-{i:03d}.txt')
         write_prompt_thinking_response(thinking_path, prompt_texts[i], thinking_chain, response)
 
 
-def vllm_test():
+def vllm_test_harmony():
     prompt_list = [
         "\nYour task is to understand natural language goals for a household robot, reason about the object states and relationships, and turn natural language goals into symbolic goals in the given format. The goals include: node goals describing object states, edge goals describing object relationships and action goals describing must-to-do actions in this goal. The input will be the goal's name, the goal's description, relevant objects as well as their current and all possible states, and all possible relationships between objects. The output should be the symbolic version of the goals.\n\n\nRelevant objects in the scene indicates those objects involved in the action execution initially. It will include the object name, the object initial states, and the object all possible states. It follows the format: object name, id: ...(object id), states: ...(object states), possible states: ...(all possible states). Your proposed object states should be within the following set: CLOSED, OPEN, ON, OFF, SITTING, DIRTY, CLEAN, LYING, PLUGGED_IN, PLUGGED_OUT.\n\n\nRelevant objects in the scene are:\ncharacter, initial states: [], possible states: ['LYING', 'SITTING']\nbathroom, initial states: ['CLEAN'], possible states: ['CLEAN']\ndining_room, initial states: ['CLEAN'], possible states: ['CLEAN']\nbasket_for_clothes, initial states: ['CLOSED', 'CLEAN'], possible states: ['CLEAN', 'CLOSED', 'OPEN', 'EMPTY', 'FULL', 'GRABBED', 'OPEN']\nwashing_machine, initial states: ['CLOSED', 'CLEAN', 'OFF', 'PLUGGED_IN'], possible states: ['CLEAN', 'CLOSED', 'OFF', 'ON', 'OPEN', 'PLUGGED_IN', 'BROKEN', 'CLOSED', 'EMPTY', 'FULL', 'OFF', 'ON', 'OPEN']\nsoap, initial states: ['CLEAN'], possible states: ['CLEAN', 'DRY', 'GRABBED', 'WET']\nclothes_jacket, initial states: ['CLEAN'], possible states: ['CLEAN', 'DIRTY', 'CLEAN', 'DIRTY', 'FOLDED', 'FREE', 'GRABBED', 'OCCUPIED', 'UNFOLDED']\n\n\nAll possible relationships are the keys of the following dictionary, and the corresponding values are their descriptions:\n{'ON': 'An object rests atop another, like a book on a table.', 'FACING': 'One object is oriented towards another, as in a person facing a wall.', 'HOLDS_LH': 'An object is held or supported by the left hand, like a left hand holding a ball.', 'INSIDE': 'An object is contained within another, like coins inside a jar.', 'BETWEEN': 'An object is situated spatially between two entities, like a park between two buildings.', 'HOLDS_RH': 'An object is grasped or carried by the right hand, such as a right hand holding a pen.', 'CLOSE': 'Objects are near each other without touching, like two close-standing trees.'}\n\n\nSymbolic goals format:\nNode goals should be a list indicating the desired ending states of objects. Each goal in the list should be a dictionary with two keys 'name' and 'state'. The value of 'name' is the name of the object, and the value of 'state' is the desired ending state of the target object. For example, [{'name': 'washing_machine', 'state': 'PLUGGED_IN'}, {'name': 'washing_machine', 'state': 'CLOSED'}, {'name': 'washing_machine', 'state': 'ON'}] requires the washing_machine to be PLUGGED_IN, CLOSED, and ON. It can be a valid interpretation of natural language goal: \nTask name: Wash clothes. \nTask description: Washing pants with washing machine\nThis is because if one wants to wash clothes, the washing machine should be functioning, and thus should be PLUGGED_IN, CLOSED, and ON.\n\nEdge goals is a list of dictionaries indicating the desired relationships between objects. Each goal in the list is a dictionary with three keys 'from_name', and 'relation' and 'to_name'. The value of 'relation' is desired relationship between 'from_name' object to 'to_name' object. The value of 'from_name' and 'to_name' should be an object name. The value of 'relation' should be an relationship. All relations should only be within the following set: ON, INSIDE, BETWEEN, CLOSE, FACING, HOLDS_RH, HOLDS_LH.\n\nEach relation has a fixed set of objects to be its 'to_name' target. Here is a dictionary where keys are 'relation' and corresponding values is its possible set of 'to_name' objects:\n{'ON': {'table', 'character', 'dishwasher', 'toilet', 'oven', 'couch', 'bed', 'washing_machine', 'coffe_maker'}, 'HOLDS_LH': {'water_glass', 'novel', 'tooth_paste', 'keyboard', 'spectacles', 'toothbrush'}, 'HOLDS_RH': {'phone', 'mouse', 'water_glass', 'remote_control', 'address_book', 'novel', 'tooth_paste', 'cup', 'drinking_glass', 'toothbrush'}, 'INSIDE': {'home_office', 'hands_both', 'freezer', 'bathroom', 'dining_room'}, 'FACING': {'phone', 'toilet', 'television', 'computer', 'laptop', 'remote_control'}, 'CLOSE': {'shower', 'cat'}}\n\nAction goals is a list of actions that must be completed in the goals. The number of actions is less than three. If node goals and edge goals are not enough to fully describe the goal, add action goals to describe the goal. Below is a dictionary of possible actions, whose keys are all possible actions and values are corresponding descriptions. When output actions goal list, each action goal should be a dictionary with keys 'action' and 'description'.\n{'CLOSE': 'as opposed to open sth, CLOSE sth means changing the state from OPEN to CLOSE, not get close to!', 'DRINK': 'drink up sth', 'FIND': 'find and get near to sth', 'WALK': 'walk towards sth, get near to sth', 'GRAB': 'graph sth', 'LOOKAT': 'look at sth, face sth', 'LOOKAT_SHORT': 'shortly look at sth', 'LOOKAT_LONG': 'look at sth for long', 'OPEN': 'open sth, as opposed to close sth', 'POINTAT': 'point at sth', 'PUTBACK': 'put object A back to object B', 'PUTIN': 'put object A into object B', 'PUTOBJBACK': 'put object back to its original place', 'RUN': 'run towards sth, get close to sth', 'SIT': 'sit on sth', 'STANDUP': 'stand up', 'SWITCHOFF': 'switch sth off (normally lamp/light)', 'SWITCHON': 'switch sth on (normally lamp/light)', 'TOUCH': 'touch sth', 'TURNTO': 'turn and face sth', 'WATCH': 'watch sth', 'WIPE': 'wipe sth out', 'PUTON': 'put on clothes, need to hold the clothes first', 'PUTOFF': 'put off clothes', 'GREET': 'greet to somebody', 'DROP': \"drop something in robot's current room, need to hold the thing first\", 'READ': 'read something, need to hold the thing first', 'LIE': 'lie on something, need to get close the thing first', 'POUR': 'pour object A into object B', 'TYPE': 'type on keyboard', 'PUSH': 'move sth', 'PULL': 'move sth', 'MOVE': 'move sth', 'WASH': 'wash sth', 'RINSE': 'rinse sth', 'SCRUB': 'scrub sth', 'SQUEEZE': 'squeeze the clothes', 'PLUGIN': 'plug in the plug', 'PLUGOUT': 'plug out the plug', 'CUT': 'cut some food', 'EAT': 'eat some food', 'RELEASE': 'drop sth inside the current room'}\n\nGoal name and goal description:\nGoal name: Wash clothes\n\nGoal description: Walk to the kitchen and find the basket of clothes. Put the soap and clothes into the washing machine. Turn on the washing machine.\n\n\n\nNow output the symbolic version of the goal. Output in json format, whose keys are 'node goals', 'edge goals', and 'action goals', and values are your output of symbolic node goals, symbolic edge goals, and symbolic action goals, respectively. That is, {'node goals': SYMBOLIC NODE GOALS, 'edge goals': SYMBOLIC EDGE GOALS, 'action goals': SYMBOLIC ACTION GOALS}. Please strictly follow the symbolic goal format.\n",
         "\nYour task is to understand natural language goals for a household robot, reason about the object states and relationships, and turn natural language goals into symbolic goals in the given format. The goals include: node goals describing object states, edge goals describing object relationships and action goals describing must-to-do actions in this goal. The input will be the goal's name, the goal's description, relevant objects as well as their current and all possible states, and all possible relationships between objects. The output should be the symbolic version of the goals.\n\n\nRelevant objects in the scene indicates those objects involved in the action execution initially. It will include the object name, the object initial states, and the object all possible states. It follows the format: object name, id: ...(object id), states: ...(object states), possible states: ...(all possible states). Your proposed object states should be within the following set: CLOSED, OPEN, ON, OFF, SITTING, DIRTY, CLEAN, LYING, PLUGGED_IN, PLUGGED_OUT.\n\n\nRelevant objects in the scene are:\ncharacter, initial states: [], possible states: ['LYING', 'SITTING']\nwashing_machine, initial states: ['CLOSED', 'CLEAN', 'OFF', 'PLUGGED_IN'], possible states: ['CLEAN', 'CLOSED', 'OFF', 'ON', 'OPEN', 'PLUGGED_IN', 'BROKEN', 'CLOSED', 'EMPTY', 'FULL', 'OFF', 'ON', 'OPEN']\nclothes_pants, initial states: ['CLEAN'], possible states: ['CLEAN', 'DIRTY', 'CLEAN', 'DIRTY', 'FOLDED', 'FREE', 'GRABBED', 'OCCUPIED', 'UNFOLDED']\nclothes_pants, initial states: ['CLEAN'], possible states: ['CLEAN', 'DIRTY', 'CLEAN', 'DIRTY', 'FOLDED', 'FREE', 'GRABBED', 'OCCUPIED', 'UNFOLDED']\nclothes_shirt, initial states: ['CLEAN'], possible states: ['CLEAN', 'DIRTY', 'CLEAN', 'DIRTY', 'FOLDED', 'FREE', 'GRABBED', 'OCCUPIED', 'UNFOLDED']\nclothes_shirt, initial states: ['CLEAN'], possible states: ['CLEAN', 'DIRTY', 'CLEAN', 'DIRTY', 'FOLDED', 'FREE', 'GRABBED', 'OCCUPIED', 'UNFOLDED']\nsoap, initial states: ['CLEAN'], possible states: ['CLEAN', 'DRY', 'GRABBED', 'WET']\n\n\nAll possible relationships are the keys of the following dictionary, and the corresponding values are their descriptions:\n{'ON': 'An object rests atop another, like a book on a table.', 'FACING': 'One object is oriented towards another, as in a person facing a wall.', 'HOLDS_LH': 'An object is held or supported by the left hand, like a left hand holding a ball.', 'INSIDE': 'An object is contained within another, like coins inside a jar.', 'BETWEEN': 'An object is situated spatially between two entities, like a park between two buildings.', 'HOLDS_RH': 'An object is grasped or carried by the right hand, such as a right hand holding a pen.', 'CLOSE': 'Objects are near each other without touching, like two close-standing trees.'}\n\n\nSymbolic goals format:\nNode goals should be a list indicating the desired ending states of objects. Each goal in the list should be a dictionary with two keys 'name' and 'state'. The value of 'name' is the name of the object, and the value of 'state' is the desired ending state of the target object. For example, [{'name': 'washing_machine', 'state': 'PLUGGED_IN'}, {'name': 'washing_machine', 'state': 'CLOSED'}, {'name': 'washing_machine', 'state': 'ON'}] requires the washing_machine to be PLUGGED_IN, CLOSED, and ON. It can be a valid interpretation of natural language goal: \nTask name: Wash clothes. \nTask description: Washing pants with washing machine\nThis is because if one wants to wash clothes, the washing machine should be functioning, and thus should be PLUGGED_IN, CLOSED, and ON.\n\nEdge goals is a list of dictionaries indicating the desired relationships between objects. Each goal in the list is a dictionary with three keys 'from_name', and 'relation' and 'to_name'. The value of 'relation' is desired relationship between 'from_name' object to 'to_name' object. The value of 'from_name' and 'to_name' should be an object name. The value of 'relation' should be an relationship. All relations should only be within the following set: ON, INSIDE, BETWEEN, CLOSE, FACING, HOLDS_RH, HOLDS_LH.\n\nEach relation has a fixed set of objects to be its 'to_name' target. Here is a dictionary where keys are 'relation' and corresponding values is its possible set of 'to_name' objects:\n{'ON': {'table', 'character', 'dishwasher', 'toilet', 'oven', 'couch', 'bed', 'washing_machine', 'coffe_maker'}, 'HOLDS_LH': {'water_glass', 'novel', 'tooth_paste', 'keyboard', 'spectacles', 'toothbrush'}, 'HOLDS_RH': {'phone', 'mouse', 'water_glass', 'remote_control', 'address_book', 'novel', 'tooth_paste', 'cup', 'drinking_glass', 'toothbrush'}, 'INSIDE': {'home_office', 'hands_both', 'freezer', 'bathroom', 'dining_room'}, 'FACING': {'phone', 'toilet', 'television', 'computer', 'laptop', 'remote_control'}, 'CLOSE': {'shower', 'cat'}}\n\nAction goals is a list of actions that must be completed in the goals. The number of actions is less than three. If node goals and edge goals are not enough to fully describe the goal, add action goals to describe the goal. Below is a dictionary of possible actions, whose keys are all possible actions and values are corresponding descriptions. When output actions goal list, each action goal should be a dictionary with keys 'action' and 'description'.\n{'CLOSE': 'as opposed to open sth, CLOSE sth means changing the state from OPEN to CLOSE, not get close to!', 'DRINK': 'drink up sth', 'FIND': 'find and get near to sth', 'WALK': 'walk towards sth, get near to sth', 'GRAB': 'graph sth', 'LOOKAT': 'look at sth, face sth', 'LOOKAT_SHORT': 'shortly look at sth', 'LOOKAT_LONG': 'look at sth for long', 'OPEN': 'open sth, as opposed to close sth', 'POINTAT': 'point at sth', 'PUTBACK': 'put object A back to object B', 'PUTIN': 'put object A into object B', 'PUTOBJBACK': 'put object back to its original place', 'RUN': 'run towards sth, get close to sth', 'SIT': 'sit on sth', 'STANDUP': 'stand up', 'SWITCHOFF': 'switch sth off (normally lamp/light)', 'SWITCHON': 'switch sth on (normally lamp/light)', 'TOUCH': 'touch sth', 'TURNTO': 'turn and face sth', 'WATCH': 'watch sth', 'WIPE': 'wipe sth out', 'PUTON': 'put on clothes, need to hold the clothes first', 'PUTOFF': 'put off clothes', 'GREET': 'greet to somebody', 'DROP': \"drop something in robot's current room, need to hold the thing first\", 'READ': 'read something, need to hold the thing first', 'LIE': 'lie on something, need to get close the thing first', 'POUR': 'pour object A into object B', 'TYPE': 'type on keyboard', 'PUSH': 'move sth', 'PULL': 'move sth', 'MOVE': 'move sth', 'WASH': 'wash sth', 'RINSE': 'rinse sth', 'SCRUB': 'scrub sth', 'SQUEEZE': 'squeeze the clothes', 'PLUGIN': 'plug in the plug', 'PLUGOUT': 'plug out the plug', 'CUT': 'cut some food', 'EAT': 'eat some food', 'RELEASE': 'drop sth inside the current room'}\n\nGoal name and goal description:\nGoal name: Wash clothes\n\nGoal description: I will load the dirty clothes into the washing machine.\n\n\n\nNow output the symbolic version of the goal. Output in json format, whose keys are 'node goals', 'edge goals', and 'action goals', and values are your output of symbolic node goals, symbolic edge goals, and symbolic action goals, respectively. That is, {'node goals': SYMBOLIC NODE GOALS, 'edge goals': SYMBOLIC EDGE GOALS, 'action goals': SYMBOLIC ACTION GOALS}. Please strictly follow the symbolic goal format.\n",
@@ -119,12 +124,12 @@ def vllm_test():
     ]
     try:
         use_vllm(prompt_list,
-                 model_name='Qwen/Qwen3-30B-A3B-Thinking-2507-FP8',
-                 context_len=65536,
+                 model_name='openai/gpt-oss-120b',
                  gpu_memory=0.9,
+                 context_len=65536,
                  sp_max=8192,
-                 sp_temp=0.6,
-                 sp_p=0.95,
+                 sp_temp=0.7,
+                 sp_p=0.8,
                  sp_k=20,
                  sp_rp=1.00,
                  sp_pp=0.0)
@@ -133,4 +138,4 @@ def vllm_test():
 
 
 if __name__ == '__main__':
-    vllm_test()
+    vllm_test_harmony()
