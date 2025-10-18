@@ -6,13 +6,6 @@ Keith (artcmd)
 Qwen3 with vLLM as offline inference engine
 model: Qwen/Qwen3-30B-A3B-Thinking-2507-FP8
 GPU: one single Nvidia H100
-
-package version in conda environment: python=3.11.13
-Name                     Version          Build            Channel
-vllm                     0.10.2           pypi_0           pypi
-torch                    2.8.0            pypi_0           pypi
-tokenizers               0.22.1           pypi_0           pypi
-transformers             4.57.0.dev0      pypi_0           pypi
 """
 
 import os
@@ -82,14 +75,14 @@ def use_vllm(all_prompts,
     os.makedirs(thinking_dir, exist_ok=True)
     print('[I:use_vllm]', tensor_parallel_size, 'GPUs are detected!')
 
-    # https://docs.vllm.ai/en/v0.10.2/api/vllm/#vllm.LLM
+    # https://docs.vllm.ai/en/v0.11.0/api/vllm/#vllm.LLM
     llm = LLM(model=model_name,
               dtype='auto',
               tensor_parallel_size=tensor_parallel_size,
               trust_remote_code=True,
               gpu_memory_utilization=gpu_memory,
               max_model_len=context_len)
-    # https://docs.vllm.ai/en/v0.10.2/api/vllm/sampling_params.html
+    # https://docs.vllm.ai/en/v0.11.0/api/vllm/sampling_params.html
     sampling_params = SamplingParams(max_tokens=sp_max,
                                      temperature=sp_temp,
                                      top_p=sp_p,

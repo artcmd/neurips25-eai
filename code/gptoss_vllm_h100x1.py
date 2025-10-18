@@ -5,13 +5,6 @@ Keith (artcmd)
 GPT-OSS with vLLM as offline inference engine
 model: openai/gpt-oss-120b
 GPU: one single Nvidia H100
-
-package version in conda environment: python=3.12.11
-Name                     Version                   Build            Channel
-vllm                     0.10.1+gptoss             pypi_0           pypi
-torch                    2.9.0.dev20250804+cu128   pypi_0           pypi
-tokenizers               0.22.1                    pypi_0           pypi
-transformers             4.56.2                    pypi_0           pypi
 """
 
 import os
